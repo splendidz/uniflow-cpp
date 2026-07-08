@@ -584,126 +584,121 @@ Creating multiple `Runtime`s yields multiple pump threads. With `Runtime::Link()
 
 ### 3. Flat Structure - flat code structure and team consistency
 
-Implementing ordered logic by hand typically nests flags and conditionals until the code depth grows deep. Even experienced developers struggle to avoid this once time passes and requirements accumulate.
+Take a task any robot orchestration layer has to write. On ROS2, the orchestrator sends a move command to the motion module, waits for the arrival reply, and only then turns the camera on and inspects a frame. A command you send and the reply you expect back are a logical **pair** - but in a callback- or thread-split design that pairing is nowhere in the code.
 
 ```cpp
-// a typical flag-based structure - nesting and flags explode as stages and exception paths grow
-void Update()
+// ROS2 callback style - the protocol is smeared across a constructor, a sender,
+// two subscription callbacks, a spin thread, and a bag of flags behind a lock.
+class PickNode : public rclcpp::Node
 {
-    if (estop_)
+public:
+    PickNode() : Node("pick")
     {
-        // e-stop can arrive at any stage - every progress flag must be rolled back here
-        connecting_ = false;
-        cmd_sent_   = false;
-        waiting_ack_ = false;
-        // forgot draining_ - a bug that waits for a ghost ack next cycle
-        if (!device_.IsSafe())
-        {
-            return;
-        }
-        estop_ = false;
+        goal_pub_   = create_publisher<MotionGoal>("/motion/goal", 10);
+        cam_client_ = create_client<EnableCamera>("/camera/enable");
+        // the two replies we care about arrive on subscriptions, wired up here -
+        // far from where the command will actually be sent
+        result_sub_ = create_subscription<MotionResult>(
+            "/motion/result", 10, [this](MotionResult::SharedPtr m) { OnMotionResult(m); });
+        frame_sub_  = create_subscription<Image>(
+            "/camera/frame", 10, [this](Image::SharedPtr m) { OnFrame(m); });
+        // callbacks fire on the executor thread; StartPick is called from another -
+        // so every shared flag below now needs a lock
+        spin_thread_ = std::thread([this] { rclcpp::spin(shared_from_this()); });
     }
 
-    if (!connected_)
+    void StartPick(const Pose& target)
     {
-        if (!connecting_)
-        {
-            device_.BeginConnect();
-            connecting_   = true;
-            connect_timer_.Restart();
-        }
-        else if (device_.IsConnected())
-        {
-            connected_  = true;
-            connecting_ = false;
-        }
-        else if (connect_timer_.Passed(5000ms))
-        {
-            if (++reconnect_count_ > 3)
-            {
-                fault_ = true;       // but fault_ is read not at the top of the function, but way down there
-            }
-            connecting_ = false;     // reset to retry - and where is reconnect_count_ reset?
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        goal_pub_->publish(MakeGoal(target));        // fire the command...
+        waiting_arrival_ = true;                     // ...and remember, by hand, what we now expect
+        // nothing here waits - control returns to the caller immediately
     }
-    else if (!cmd_sent_)
+
+private:
+    // fires at some unknown later time, on the executor thread, for some reply
+    void OnMotionResult(MotionResult::SharedPtr msg)
     {
-        if (input_.HasRequest() && !draining_)
-        {
-            device_.Send(input_.Take());
-            cmd_sent_    = true;
-            waiting_ack_ = true;     // an implicit rule that the two flags must always move as a pair
-            cmd_timer_.Restart();
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!waiting_arrival_) return;               // is this reply even for us? guess from a flag
+        waiting_arrival_ = false;
+        if (!msg->ok) { fault_ = true; return; }     // failure handling, stranded far from the send site
+        cam_client_->async_send_request(std::make_shared<EnableCamera::Request>());
+        waiting_frame_ = true;                        // a second expectation - a second flag
     }
-    else if (waiting_ack_)
+
+    void OnFrame(Image::SharedPtr msg)
     {
-        if (device_.HasAck())
-        {
-            // success - if even one of these 5 lines is missing, the next command is blocked forever
-            cmd_sent_     = false;
-            waiting_ack_  = false;
-            retry_count_  = 0;
-            reconnect_count_ = 0;
-            draining_     = input_.HasRequest();
-        }
-        else if (cmd_timer_.Passed(3000ms))
-        {
-            if (++retry_count_ < 3)
-            {
-                cmd_sent_    = false;   // mimic returning to Step3 with a combination of flags
-                waiting_ack_ = false;
-            }
-            else if (!fault_)
-            {
-                fault_ = true;
-                connected_ = false;    // roll back even the connection - then what about reconnect_count_...?
-            }
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!waiting_frame_) return;
+        waiting_frame_ = false;
+        Inspect(msg);
+        // a late frame from a goal we already gave up on lands here too - the flags
+        // cannot tell which goal it belonged to, so a stale message takes the live path
     }
-    // what about handling fault_? what if estop_ and fault_ are simultaneous? no branch spells it out
-}
+
+    rclcpp::Publisher<MotionGoal>::SharedPtr      goal_pub_;
+    rclcpp::Client<EnableCamera>::SharedPtr       cam_client_;
+    rclcpp::Subscription<MotionResult>::SharedPtr result_sub_;
+    rclcpp::Subscription<Image>::SharedPtr        frame_sub_;
+    std::thread spin_thread_;
+    std::mutex  mu_;
+    bool waiting_arrival_ = false;   // the whole protocol, reduced to a bag of flags
+    bool waiting_frame_   = false;
+    bool fault_           = false;
+    // and the "no reply at all within 10s" timeout? it lives nowhere yet - it would
+    // need its own timer, its own callback, and a reset on every path above
+};
 ```
 
-In uniflow, the same logic becomes one named function per stage.
+Read `StartPick` alone and you cannot tell what happens after the command goes out. Read `OnMotionResult` alone and you cannot tell what command it answers, or when it fires. The sequence "send goal -> await arrival -> enable camera -> await frame -> inspect" lives only in the developer's head; the code smears it across a constructor, a sender, and two callbacks stitched together by `waiting_arrival_`/`waiting_frame_`. Because a callback runs whenever a message happens to land - on a different thread, hence the lock - the timing is invisible, a stale reply to an abandoned goal follows the exact same path as a fresh one, and the one thing the diagram would show most clearly, the 10-second "the reply never came" timeout, has no home at all.
+
+In uniflow the command and the reply it expects sit right next to each other, and the flow waits for that reply at the very spot it sent the command.
 
 ```cpp
-StepResult Step1_Connect()
+StepResult Step1_SendGoal()
 {
-    flow().device_.BeginConnect();
-    return Next(UF_FN(Step2_WaitConnected));
+    flow().motion_.SendGoal(target_);                 // send the move command...
+    return Next(UF_FN(Step2_WaitArrived));            // ...expecting an arrival reply next
 }
 
-StepResult Step2_WaitConnected()
+StepResult Step2_WaitArrived()
 {
-    if (!flow().device_.IsConnected()) return Stay();   // re-poll this step until connected
-    return Next(UF_FN(Step3_WaitRequest));
+    if (!flow().motion_.HasReply())
+        return StayTimeout(10s, UF_FN(Step_Abort));   // wait right here; no reply in 10s -> abort
+    if (!flow().motion_.Reply().ok) return Fail();    // arrived, but the module refused
+    return Next(UF_FN(Step3_EnableCamera));           // arrived ok -> now, and only now, the camera
 }
 
-StepResult Step3_WaitRequest()
+StepResult Step3_EnableCamera()
 {
-    if (!flow().input_.HasRequest()) return Stay();
-    flow().device_.Send(flow().input_.Take());
-    return Next(UF_FN(Step4_WaitAck));
+    flow().camera_.Enable();
+    return Next(UF_FN(Step4_WaitFrame));
 }
 
-StepResult Step4_WaitAck()
+StepResult Step4_WaitFrame()
 {
-    if (flow().device_.HasAck()) { flow().OnSuccess(); return Done(); }
-    return StayTimeout(3000ms, UF_FN(Step5_Timeout));     // no ack within 3s -> go to the timeout step
+    if (!flow().camera_.HasFrame()) return Stay();    // wait right here for the frame
+    flow().Inspect(flow().camera_.TakeFrame());
+    return Done();
 }
 
-StepResult Step5_Timeout()
+StepResult Step_Abort()
 {
-    if (++retry_count < 3) return Next(UF_FN(Step3_WaitRequest));   // retry_count is a task member
-    flow().OnFail();
+    flow().motion_.Cancel();
     return Fail();
 }
 ```
 
-What exploded in the flag version above - `connected_`/`connecting_`/`cmd_sent_`/`waiting_ack_`/`draining_`/`fault_`/`estop_` implicitly responsible for resetting one another, with e-stop and fault able to cut in at any branch, so "forgetting a reset becomes a bug" - is gone. Brace depth is fixed, and each state becomes one named step. Even cross-cutting paths like e-stop/fault are expressed not as flags but as explicit transitions (`StayTimeout`/`Next`/`Fail`), so adding a stage means adding one function and changing only its wiring, leaving the rest of the stages untouched.
+The command and the reply it waits for are adjacent: `Step1` sends, `Step2` right below it is the wait for that command's answer. The expectation is written down - "I sent a goal, so I wait for a goal reply, and nothing else advances until it arrives (or 10s pass)." There are no `waiting_*` flags, because "which reply am I waiting for" is simply "which step am I in." A stale reply to an already-abandoned goal cannot slip through, because the flow is not listening for it - it is parked on `Step2` or has already moved past it. `Step_Abort` carries no number because it is an off-path exit, not another stage in the sequence.
 
-This structure also helps in team work. Because every developer expresses logic in the same pattern, the stage structure is grasped immediately in code review. Because the framework enforces the pattern, consistent code results regardless of experience level.
+And here is the decisive part: the steps above **are** a state chart. Read the code top to bottom and you trace the exact same path as reading the diagram below - every step is one node, and every `return` (`Next`/`Stay`/`StayTimeout`/`Done`/`Fail`) is one labeled edge. There is no translation step between "the diagram the engineer drew on the whiteboard" and "the code that ships."
+
+![State chart maps 1:1 to uniflow steps](.res/flat_flowchart.png)
+
+This is what the callback version cannot offer. There, a state like "goal sent, waiting for arrival" exists only as `waiting_arrival_ == true` spread across two handlers - you cannot point at it in a diagram, and you cannot point at it in the code either. In uniflow that state is literally `Step2_WaitArrived`, one named function you can point at, set a breakpoint on, and match to one box in the chart.
+
+This structure also helps in team work. Because every developer expresses request/reply logic in the same pattern, the sequence is grasped immediately in code review. Because the framework enforces the pattern, consistent code results regardless of experience level.
 
 ---
 

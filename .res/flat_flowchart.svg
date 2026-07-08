@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="880" viewBox="0 0 980 880" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#6366f1"/>
+    </marker>
+    <marker id="arrowLoop" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#f59e0b"/>
+    </marker>
+    <marker id="arrowOk" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#16a34a"/>
+    </marker>
+    <marker id="arrowFail" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#dc2626"/>
+    </marker>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="stepFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef2ff"/>
+    </linearGradient>
+    <linearGradient id="abortFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#fef2f2"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="980" height="880" fill="#ffffff"/>
+
+  <!-- header -->
+  <rect x="60" y="34" width="44" height="6" rx="3" fill="url(#accent)"/>
+  <text x="60" y="74" font-size="28" font-weight="700" fill="#0f172a">State chart = code, 1 : 1</text>
+  <text x="60" y="102" font-size="15" fill="#64748b">A command and the reply it expects are adjacent. Each Step is one node; each return is one labeled edge.</text>
+
+  <!-- ===================== happy-path spine ===================== -->
+  <!-- START -->
+  <g filter="url(#soft)">
+    <ellipse cx="360" cy="158" rx="80" ry="24" fill="#312e81"/>
+  </g>
+  <text x="360" y="163" text-anchor="middle" font-size="13" font-weight="700" fill="#ffffff">START / Entry</text>
+  <line x1="360" y1="182" x2="360" y2="200" stroke="#6366f1" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+  <!-- Step1 -->
+  <g filter="url(#soft)">
+    <rect x="245" y="200" width="230" height="56" rx="12" fill="url(#stepFill)" stroke="#6366f1" stroke-width="1.6"/>
+  </g>
+  <text x="360" y="224" text-anchor="middle" font-size="14" font-weight="700" fill="#312e81">Step1_SendGoal</text>
+  <text x="360" y="243" text-anchor="middle" font-size="11.5" fill="#64748b">send the move command</text>
+
+  <!-- Step1 -> Step2 -->
+  <line x1="360" y1="256" x2="360" y2="298" stroke="#6366f1" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <rect x="370" y="266" width="118" height="20" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="429" y="280" text-anchor="middle" font-size="11" font-weight="700" fill="#4f46e5">Next(Step2)</text>
+
+  <!-- Step2 -->
+  <g filter="url(#soft)">
+    <rect x="245" y="298" width="230" height="56" rx="12" fill="url(#stepFill)" stroke="#6366f1" stroke-width="1.6"/>
+  </g>
+  <text x="360" y="322" text-anchor="middle" font-size="14" font-weight="700" fill="#312e81">Step2_WaitArrived</text>
+  <text x="360" y="341" text-anchor="middle" font-size="11.5" fill="#64748b">wait here for the arrival reply</text>
+
+  <!-- Step2 self-loop (StayTimeout keeps polling) -->
+  <path d="M245,312 C 197,312 197,340 245,340" fill="none" stroke="#f59e0b" stroke-width="1.8" marker-end="url(#arrowLoop)"/>
+  <text x="189" y="320" text-anchor="end" font-size="11" font-weight="700" fill="#b45309">StayTimeout(10s)</text>
+  <text x="189" y="336" text-anchor="end" font-size="10.5" fill="#92764a">reply not here yet</text>
+
+  <!-- Step2 -> Step_Abort (deadline elapsed) -->
+  <line x1="475" y1="326" x2="600" y2="326" stroke="#f59e0b" stroke-width="1.8" marker-end="url(#arrowLoop)"/>
+  <rect x="492" y="304" width="92" height="20" rx="10" fill="#fffbeb" stroke="#fcd34d"/>
+  <text x="538" y="318" text-anchor="middle" font-size="11" font-weight="700" fill="#b45309">10s elapsed</text>
+
+  <!-- Step_Abort -->
+  <g filter="url(#soft)">
+    <rect x="600" y="298" width="220" height="56" rx="12" fill="url(#abortFill)" stroke="#f59e0b" stroke-width="1.6"/>
+  </g>
+  <text x="710" y="322" text-anchor="middle" font-size="14" font-weight="700" fill="#b45309">Step_Abort</text>
+  <text x="710" y="341" text-anchor="middle" font-size="11.5" fill="#92764a">cancel the goal and give up</text>
+
+  <!-- Step_Abort -> FAIL -->
+  <line x1="710" y1="354" x2="710" y2="626" stroke="#dc2626" stroke-width="1.8" marker-end="url(#arrowFail)"/>
+  <rect x="716" y="474" width="70" height="20" rx="10" fill="#fef2f2" stroke="#fca5a5"/>
+  <text x="751" y="488" text-anchor="middle" font-size="11" font-weight="700" fill="#dc2626">Fail()</text>
+
+  <!-- Step2 -> Step3 (arrived ok) -->
+  <line x1="360" y1="354" x2="360" y2="418" stroke="#6366f1" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <rect x="370" y="376" width="118" height="20" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="429" y="390" text-anchor="middle" font-size="11" font-weight="700" fill="#4f46e5">Next(Step3)</text>
+  <text x="498" y="390" font-size="10.5" fill="#64748b">arrived ok</text>
+
+  <!-- Step2 -> FAIL (reply not ok) -->
+  <line x1="475" y1="350" x2="656" y2="630" stroke="#dc2626" stroke-width="1.8" marker-end="url(#arrowFail)"/>
+  <rect x="520" y="480" width="146" height="20" rx="10" fill="#fef2f2" stroke="#fca5a5"/>
+  <text x="593" y="494" text-anchor="middle" font-size="11" font-weight="700" fill="#dc2626">Fail() - reply not ok</text>
+
+  <!-- Step3 -->
+  <g filter="url(#soft)">
+    <rect x="245" y="418" width="230" height="56" rx="12" fill="url(#stepFill)" stroke="#6366f1" stroke-width="1.6"/>
+  </g>
+  <text x="360" y="442" text-anchor="middle" font-size="14" font-weight="700" fill="#312e81">Step3_EnableCamera</text>
+  <text x="360" y="461" text-anchor="middle" font-size="11.5" fill="#64748b">turn the camera on</text>
+
+  <!-- Step3 -> Step4 -->
+  <line x1="360" y1="474" x2="360" y2="520" stroke="#6366f1" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <rect x="370" y="487" width="118" height="20" rx="10" fill="#eef2ff" stroke="#c7d2fe"/>
+  <text x="429" y="501" text-anchor="middle" font-size="11" font-weight="700" fill="#4f46e5">Next(Step4)</text>
+
+  <!-- Step4 -->
+  <g filter="url(#soft)">
+    <rect x="245" y="520" width="230" height="56" rx="12" fill="url(#stepFill)" stroke="#6366f1" stroke-width="1.6"/>
+  </g>
+  <text x="360" y="544" text-anchor="middle" font-size="14" font-weight="700" fill="#312e81">Step4_WaitFrame</text>
+  <text x="360" y="563" text-anchor="middle" font-size="11.5" fill="#64748b">wait here for a camera frame</text>
+
+  <!-- Step4 self-loop (Stay) -->
+  <path d="M245,534 C 197,534 197,562 245,562" fill="none" stroke="#f59e0b" stroke-width="1.8" marker-end="url(#arrowLoop)"/>
+  <text x="189" y="542" text-anchor="end" font-size="11" font-weight="700" fill="#b45309">Stay()</text>
+  <text x="189" y="558" text-anchor="end" font-size="10.5" fill="#92764a">no frame yet</text>
+
+  <!-- Step4 -> DONE -->
+  <line x1="360" y1="576" x2="360" y2="634" stroke="#16a34a" stroke-width="1.8" marker-end="url(#arrowOk)"/>
+  <rect x="372" y="596" width="72" height="20" rx="10" fill="#f1fdf5" stroke="#86efac"/>
+  <text x="408" y="610" text-anchor="middle" font-size="11" font-weight="700" fill="#16a34a">Done()</text>
+  <text x="452" y="610" font-size="10.5" fill="#5b8f6a">inspect the frame</text>
+
+  <!-- DONE terminal -->
+  <g filter="url(#soft)">
+    <ellipse cx="360" cy="660" rx="62" ry="24" fill="#16a34a"/>
+  </g>
+  <text x="360" y="665" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">DONE</text>
+
+  <!-- FAIL terminal -->
+  <g filter="url(#soft)">
+    <ellipse cx="710" cy="650" rx="62" ry="24" fill="#dc2626"/>
+  </g>
+  <text x="710" y="655" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">FAIL</text>
+
+  <!-- ===================== legend ===================== -->
+  <rect x="60" y="722" width="860" height="106" rx="14" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.2"/>
+  <text x="84" y="750" font-size="13" font-weight="700" fill="#0f172a">One return keyword = one edge</text>
+
+  <line x1="90" y1="776" x2="128" y2="776" stroke="#6366f1" stroke-width="1.8" marker-end="url(#arrow)"/>
+  <text x="138" y="780" font-size="12" fill="#475569"><tspan font-weight="700" fill="#4f46e5">Next()</tspan> - advance to the next step</text>
+
+  <path d="M92,800 C 80,800 80,814 92,814" fill="none" stroke="#f59e0b" stroke-width="1.8" marker-end="url(#arrowLoop)"/>
+  <text x="138" y="811" font-size="12" fill="#475569"><tspan font-weight="700" fill="#b45309">Stay()</tspan> - re-poll the same step next round</text>
+
+  <line x1="470" y1="776" x2="508" y2="776" stroke="#f59e0b" stroke-width="1.8" stroke-dasharray="4 3" marker-end="url(#arrowLoop)"/>
+  <text x="518" y="780" font-size="12" fill="#475569"><tspan font-weight="700" fill="#b45309">StayTimeout()</tspan> - re-poll, but bail out after a deadline</text>
+
+  <line x1="470" y1="806" x2="498" y2="806" stroke="#16a34a" stroke-width="1.8" marker-end="url(#arrowOk)"/>
+  <line x1="502" y1="806" x2="530" y2="806" stroke="#dc2626" stroke-width="1.8" marker-end="url(#arrowFail)"/>
+  <text x="540" y="810" font-size="12" fill="#475569"><tspan font-weight="700" fill="#16a34a">Done()</tspan> / <tspan font-weight="700" fill="#dc2626">Fail()</tspan> - terminal state, the task ends</text>
+
+  <!-- footer -->
+  <text x="60" y="860" font-size="12.5" font-style="italic" fill="#64748b">Step1 sends; Step2 right below it waits for that command's reply - the expectation is written down, not scattered across callbacks.</text>
+</svg>

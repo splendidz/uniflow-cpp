@@ -584,126 +584,121 @@ yAxis.WaitUntilIdle();
 
 ### 3. Flat Structure - 플랫한 코드 구조와 팀 일관성
 
-순서 있는 로직을 직접 구현하면 플래그와 조건문이 중첩되면서 코드 depth가 깊어지는 것이 일반적이다. 숙련된 개발자도 시간이 지나고 요구사항이 추가되면 이 문제를 피하기 어렵다.
+로봇 오케스트레이션 계층이 흔히 짜는 작업을 보자. ROS2에서 오케스트레이터는 이동 모듈로 이동 명령을 보내고, 도착 응답을 기다리다가, 그제서야 카메라를 켜고 프레임을 검사한다. 내가 보낸 명령과 내가 기대하는 응답은 논리적으로 한 **쌍**이다 - 그런데 콜백이나 스레드로 쪼갠 설계에서는 그 쌍이 코드 어디에도 드러나지 않는다.
 
 ```cpp
-// 전형적인 플래그 기반 구조 - 단계와 예외 경로가 늘수록 중첩과 플래그가 폭발한다
-void Update()
+// ROS2 콜백 스타일 - 프로토콜이 생성자, 송신 함수, 구독 콜백 두 개,
+// spin 스레드, 그리고 락 뒤의 플래그 자루에 걸쳐 흩뿌려진다.
+class PickNode : public rclcpp::Node
 {
-    if (estop_)
+public:
+    PickNode() : Node("pick")
     {
-        // e-stop 은 어느 단계에서도 들어올 수 있다 - 모든 진행 플래그를 여기서 되돌려야 한다
-        connecting_ = false;
-        cmd_sent_   = false;
-        waiting_ack_ = false;
-        // draining_ 을 빠뜨렸다 - 다음 사이클에 유령 ack 를 기다리는 버그
-        if (!device_.IsSafe())
-        {
-            return;
-        }
-        estop_ = false;
+        goal_pub_   = create_publisher<MotionGoal>("/motion/goal", 10);
+        cam_client_ = create_client<EnableCamera>("/camera/enable");
+        // 우리가 신경 쓰는 두 응답은 구독으로 들어온다 - 정작 명령을 보낼
+        // 자리에서 멀리 떨어진 여기서 배선된다
+        result_sub_ = create_subscription<MotionResult>(
+            "/motion/result", 10, [this](MotionResult::SharedPtr m) { OnMotionResult(m); });
+        frame_sub_  = create_subscription<Image>(
+            "/camera/frame", 10, [this](Image::SharedPtr m) { OnFrame(m); });
+        // 콜백은 executor 스레드에서, StartPick 은 다른 스레드에서 호출된다 -
+        // 그래서 아래 공유 플래그마다 이제 락이 필요하다
+        spin_thread_ = std::thread([this] { rclcpp::spin(shared_from_this()); });
     }
 
-    if (!connected_)
+    void StartPick(const Pose& target)
     {
-        if (!connecting_)
-        {
-            device_.BeginConnect();
-            connecting_   = true;
-            connect_timer_.Restart();
-        }
-        else if (device_.IsConnected())
-        {
-            connected_  = true;
-            connecting_ = false;
-        }
-        else if (connect_timer_.Passed(5000ms))
-        {
-            if (++reconnect_count_ > 3)
-            {
-                fault_ = true;       // 단, fault_ 를 보는 곳은 함수 맨 위가 아니라 저 아래
-            }
-            connecting_ = false;     // 재시도 위해 리셋 - reconnect_count_ 리셋은 어디서?
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        goal_pub_->publish(MakeGoal(target));        // 명령을 쏘고...
+        waiting_arrival_ = true;                     // ...무엇을 기대하는지 손으로 기억해 둔다
+        // 여기서는 아무것도 기다리지 않는다 - 제어는 곧장 호출자에게 돌아간다
     }
-    else if (!cmd_sent_)
+
+private:
+    // 언젠가, executor 스레드에서, 어떤 응답에 대해 불특정 시점에 호출된다
+    void OnMotionResult(MotionResult::SharedPtr msg)
     {
-        if (input_.HasRequest() && !draining_)
-        {
-            device_.Send(input_.Take());
-            cmd_sent_    = true;
-            waiting_ack_ = true;     // 두 플래그가 항상 짝으로 움직여야 한다는 암묵 규칙
-            cmd_timer_.Restart();
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!waiting_arrival_) return;               // 이게 우리한테 온 응답이 맞나? 플래그로 추측
+        waiting_arrival_ = false;
+        if (!msg->ok) { fault_ = true; return; }     // 실패 처리 - 보낸 자리에서 멀리 떨어져 고립
+        cam_client_->async_send_request(std::make_shared<EnableCamera::Request>());
+        waiting_frame_ = true;                        // 두 번째 기대 - 두 번째 플래그
     }
-    else if (waiting_ack_)
+
+    void OnFrame(Image::SharedPtr msg)
     {
-        if (device_.HasAck())
-        {
-            // 성공 - 이 5줄 중 하나라도 빠지면 다음 명령이 영원히 막힌다
-            cmd_sent_     = false;
-            waiting_ack_  = false;
-            retry_count_  = 0;
-            reconnect_count_ = 0;
-            draining_     = input_.HasRequest();
-        }
-        else if (cmd_timer_.Passed(3000ms))
-        {
-            if (++retry_count_ < 3)
-            {
-                cmd_sent_    = false;   // Step3 로 되돌리는 것을 플래그 조합으로 흉내낸다
-                waiting_ack_ = false;
-            }
-            else if (!fault_)
-            {
-                fault_ = true;
-                connected_ = false;    // 연결까지 되돌린다 - 그럼 reconnect_count_ 는...?
-            }
-        }
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!waiting_frame_) return;
+        waiting_frame_ = false;
+        Inspect(msg);
+        // 이미 포기한 goal 의 뒤늦은 프레임도 여기로 들어온다 - 플래그는
+        // 그게 어느 goal 소속인지 구분하지 못해, 낡은 메시지가 산 경로를 그대로 탄다
     }
-    // fault_ 처리는? estop_ 와 fault_ 가 동시면? 분기 어디에도 명시되지 않는다
-}
+
+    rclcpp::Publisher<MotionGoal>::SharedPtr      goal_pub_;
+    rclcpp::Client<EnableCamera>::SharedPtr       cam_client_;
+    rclcpp::Subscription<MotionResult>::SharedPtr result_sub_;
+    rclcpp::Subscription<Image>::SharedPtr        frame_sub_;
+    std::thread spin_thread_;
+    std::mutex  mu_;
+    bool waiting_arrival_ = false;   // 프로토콜 전체가 플래그 자루로 쪼그라든다
+    bool waiting_frame_   = false;
+    bool fault_           = false;
+    // 그럼 "10초 안에 응답이 아예 없을 때"의 타임아웃은? 아직 어디에도 없다 -
+    // 별도 타이머, 별도 콜백, 그리고 위 모든 경로에서의 리셋이 필요하다
+};
 ```
 
-uniflow에서 같은 로직은 각 단계가 이름 있는 함수 하나가 된다.
+`StartPick` 만 읽어서는 명령을 보낸 다음 무슨 일이 일어나는지 알 수 없다. `OnMotionResult` 만 읽어서는 이게 어떤 명령에 대한 응답인지, 언제 호출되는지 알 수 없다. "goal 보내기 -> 도착 대기 -> 카메라 켜기 -> 프레임 대기 -> 검사"라는 순서는 개발자 머릿속에만 있고, 코드는 그것을 생성자, 송신 함수, 콜백 두 개에 흩뿌려 `waiting_arrival_`/`waiting_frame_` 로 꿰맨다. 콜백은 메시지가 도착할 때마다 - 그것도 다른 스레드에서, 그래서 락을 끼고 - 호출되므로 타이밍이 보이지 않고, 폐기된 goal 의 낡은 응답이 새 응답과 똑같은 경로를 타며, 다이어그램이라면 가장 선명하게 보여줄 "응답이 끝내 안 온" 10초 타임아웃은 아예 있을 자리가 없다.
+
+uniflow에서는 명령과 그것이 기대하는 응답이 바로 나란히 놓이고, 명령을 보낸 그 자리에서 응답을 기다린다.
 
 ```cpp
-StepResult Step1_Connect()
+StepResult Step1_SendGoal()
 {
-    flow().device_.BeginConnect();
-    return Next(UF_FN(Step2_WaitConnected));
+    flow().motion_.SendGoal(target_);                 // 이동 명령을 보내고...
+    return Next(UF_FN(Step2_WaitArrived));            // ...다음은 도착 응답을 기대한다
 }
 
-StepResult Step2_WaitConnected()
+StepResult Step2_WaitArrived()
 {
-    if (!flow().device_.IsConnected()) return Stay();   // 연결될 때까지 이 스텝 재폴링
-    return Next(UF_FN(Step3_WaitRequest));
+    if (!flow().motion_.HasReply())
+        return StayTimeout(10s, UF_FN(Step_Abort));   // 바로 여기서 대기; 10초 안에 응답 없으면 중단
+    if (!flow().motion_.Reply().ok) return Fail();    // 도착했지만 모듈이 거부
+    return Next(UF_FN(Step3_EnableCamera));           // 정상 도착 -> 이제, 그제서야 카메라
 }
 
-StepResult Step3_WaitRequest()
+StepResult Step3_EnableCamera()
 {
-    if (!flow().input_.HasRequest()) return Stay();
-    flow().device_.Send(flow().input_.Take());
-    return Next(UF_FN(Step4_WaitAck));
+    flow().camera_.Enable();
+    return Next(UF_FN(Step4_WaitFrame));
 }
 
-StepResult Step4_WaitAck()
+StepResult Step4_WaitFrame()
 {
-    if (flow().device_.HasAck()) { flow().OnSuccess(); return Done(); }
-    return StayTimeout(3000ms, UF_FN(Step5_Timeout));     // 3초 안에 ack 없으면 타임아웃 스텝으로
+    if (!flow().camera_.HasFrame()) return Stay();    // 프레임을 바로 여기서 기다린다
+    flow().Inspect(flow().camera_.TakeFrame());
+    return Done();
 }
 
-StepResult Step5_Timeout()
+StepResult Step_Abort()
 {
-    if (++retry_count < 3) return Next(UF_FN(Step3_WaitRequest));   // retry_count는 task 멤버
-    flow().OnFail();
+    flow().motion_.Cancel();
     return Fail();
 }
 ```
 
-위 플래그 버전에서 폭발하던 것 - `connected_`/`connecting_`/`cmd_sent_`/`waiting_ack_`/`draining_`/`fault_`/`estop_` 가 서로의 리셋을 암묵적으로 책임지고, e-stop 과 fault 가 어느 분기에서도 끼어들 수 있어 "리셋 목록을 빠뜨리면 버그"가 되던 구조 - 가 사라진다. 중괄호 depth가 고정되고, 각 상태는 이름 있는 스텝 하나가 된다. e-stop/fault 같은 횡단 경로조차 플래그가 아니라 명시적 전이(`StayTimeout`/`Next`/`Fail`)로 표현되므로, 단계를 추가할 때 함수 하나를 더하고 연결만 바꾸면 되며 나머지 단계는 손대지 않는다.
+명령과 그것이 기다리는 응답이 나란히 있다. `Step1` 이 보내고, 바로 아래 `Step2` 가 그 명령의 답을 기다리는 자리다. 기대가 코드에 적혀 있다 - "goal 을 보냈으니 goal 응답을 기다리며, 그것이 오기 전에는(또는 10초가 지나기 전에는) 아무것도 진행하지 않는다." `waiting_*` 플래그가 없는 이유는, "지금 어느 응답을 기다리는가"가 곧 "지금 어느 스텝에 있는가"이기 때문이다. 이미 폐기한 goal 의 낡은 응답은 끼어들 수 없다 - flow 가 그것을 듣고 있지 않기 때문이다. `Step2` 에 멈춰 있거나, 이미 지나쳐 버렸다. `Step_Abort` 에 번호가 없는 것은, 그것이 순서상 다음 단계가 아니라 경로에서 벗어나는 출구이기 때문이다.
 
-이 구조는 팀 작업에서도 이점이 있다. 모든 개발자가 동일한 패턴으로 로직을 표현하므로 코드 리뷰에서 단계 구조가 즉시 파악된다. 프레임워크가 패턴을 강제하므로, 경험 수준에 관계없이 일관된 코드가 만들어진다.
+그리고 여기가 결정적이다. 위 스텝들은 그 자체로 하나의 state chart다. 코드를 위에서 아래로 읽으면 아래 다이어그램을 읽는 것과 정확히 같은 경로를 따라간다 - 모든 스텝이 노드 하나이고, 모든 `return`(`Next`/`Stay`/`StayTimeout`/`Done`/`Fail`)이 라벨 붙은 엣지 하나다. "엔지니어가 화이트보드에 그린 다이어그램"과 "실제로 배포되는 코드" 사이에 번역 단계가 없다.
+
+![state chart가 uniflow 스텝과 1:1로 대응](.res/flat_flowchart.png)
+
+이것이 콜백 버전이 줄 수 없는 것이다. 콜백 버전에서 "goal 을 보내고 도착을 기다리는 중"이라는 상태는 두 처리기에 흩어진 `waiting_arrival_ == true` 로만 존재한다 - 다이어그램에서 가리킬 수도 없고, 코드에서 가리킬 수도 없다. uniflow에서 그 상태는 말 그대로 `Step2_WaitArrived`이며, 가리키고 브레이크포인트를 걸고 차트의 박스 하나에 대응시킬 수 있는 이름 있는 함수 하나다.
+
+이 구조는 팀 작업에서도 이점이 있다. 모든 개발자가 동일한 패턴으로 요청/응답 로직을 표현하므로 코드 리뷰에서 순서가 즉시 파악된다. 프레임워크가 패턴을 강제하므로, 경험 수준에 관계없이 일관된 코드가 만들어진다.
 
 ---
 
